@@ -1,42 +1,39 @@
-PATH = {
-    'param': 'param',
-    'mesh': 'data/population_and_employment/grid_1km_653_573/grid_cells.shp',
-    'graph_nodes': 'data/highway_network/england_wales_nodes_27700.json',
-    'graph_edges': 'data/highway_network/england_wales_edges_27700.json',
-    'nodes': 'data/highway_network/nodes.json',
-    'edge_features': 'data/highway_network/edge_features.json',
-    'mesh2nodes': 'data/highway_network/mesh_nodes_pairing.json',
-    'mesh2edges': 'data/highway_network/mesh_edges_pairing.json',
-    'cache': 'data/cache',
-    'population_and_employment': 'data/population_and_employment/population_and_employment.h5',
-    'landuse_and_poi': 'data/landuse_poi/landuse_and_poi-230101.h5',
-    'ground_truth': 'data/traffic_volume/traffic_volume_by_edges.csv',
-    'evaluate': 'eval/logs',
-}
-
 DATA = {
-    'population': [0],
-    'employment': [18],
-    'landuse_poi': list(range(12)),
-    'clear_cache': False,
+    'population_level': 'lv3', # 18
+    'employment_level': 'lv3', # 57
+    'households_level': 'lv3', # 33 
+    'use_population_density': True, # 2
+    'use_land_use': True, # 4
+    'use_poi': True, # 5
+    'use_imd': True, # 2
 }
 
 MODEL = {
-    'embedding_dim': 512,
-    'gnn_layers': 16, # degrees of neighbours
-    'attention_heads': 4,
-    'graph_size': 64,
+    'node_hidden': [16, 16],
+    'node_out': 16,
+    'pair_hidden': [16, 8],
+    'chunk_size': 100_000,
+    # time function
+    't_normalize': True,
+    't_hidden': [32, 32],
+    't_mean': 3600.0,
+    't_std': 1000.0,
     }
 
 TRAINING = {
-    'use_gpu': False,
-    'seed': 1,
-    'lr': 1e-4,
+    # 'checkpoint': "param/baseline1/epoch49_20251013-160503.pt",
+    "pca": True,
+    "pca_components": 64,
+    'device': 'cuda',
+    'seed': 5,
+    'lr': [1e-3, 1e-4, 1e-5],
+    'normalize': False,
     'epoch': 100,
     'clip_gradient': 5,
     'train_prop': 0.8,
-    'loss_function': 'MSE_Z',
-    'eval_metrics': ['MGEH', 'MAE'],
+    'loss_function': 'MSE',
+    'eval_metrics': ['MGEH', 'MAE', 'RMSE', 'R_square'],
     'eval_interval': 1000,
-    'eval_sample': 100,
+    'eval_sample_train': 800,
+    'eval_sample_eval': 800,
     }

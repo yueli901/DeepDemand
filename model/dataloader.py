@@ -1,76 +1,159 @@
 import torch
-import h5py
 import os
 import numpy as np
 import random
-from tqdm import tqdm
 import pandas as pd
-import geopandas as gpd
 import json
-import pyproj
-import osmnx as ox
-import dgl
-import networkx as nx
 
-from model.utils import Scaler
-from config import PATH, DATA, TRAINING
+from model.utils import ScalerMinMax
+from config import DATA, TRAINING
 
 np.random.seed(TRAINING['seed'])
 torch.manual_seed(TRAINING['seed'])
 random.seed(TRAINING['seed'])
 
-def load_mesh_features():
+def load_json(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+import torch
+
+def get_lsoa_vector(rec):
     """
-    Load the grid feature tensor with z-score normalization.
-    Returns:
-        torch tensor: shape=(height, width, channel) representing the z-score normalized pixel features for 2022.
+    Build one LSOA node's feature vector (all already min–max normalized upstream).
+
+    Feature order (concatenate in this exact order):
+      1) population[DATA['population_level']]           -> list
+      2) employment[DATA['employment_level']]           -> list
+      3) households[DATA['use_household']]              -> list (if a level string, e.g., 'lv3')
+      4) area_popdensity                                -> [area_norm, popdens_norm] (if True)
+      5) land_use                                       -> [commercial, industrial, residential, retail] (if True)
+      6) poi                                            -> [education, food, health, retail, transport] (if True)
+      7) imd                                            -> [income_norm, employment_norm] (if True)
+
+    Parameters
+    ----------
+    rec : dict
+        One LSOA record from the merged JSON, e.g.
+        {
+          "population": {"lv1":[...], "lv2":[...], "lv3":[...]},
+          "employment": {"lv1":[...], "lv2":[...], "lv3":[...]},
+          "households": {"lv1":[...], "lv2":[...], "lv3":[...]},
+          "area_popdensity": [...],
+          "land_use": [...],
+          "poi": [...],
+          "imd": [...]
+        }
+
+    DATA : dict
+        Config like:
+        {
+          'population_level': 'population_lv3',
+          'employment_level': 'employment_lv3',
+          'use_household': 'lv3',         # or 'lv1'/'lv2' or False/None to disable
+          'use_population_density': True,
+          'use_land_use': True,
+          'use_poi': True,
+          'use_imd': True,
+        }
+
+    Returns
+    -------
+    torch.FloatTensor shape (D,)
     """
-    with h5py.File(PATH["population_and_employment"], 'r') as f:
-        pe = f['features'][..., [item for sublist in [DATA['population'], DATA['employment']] for item in sublist]]
-    year, row, col, c = pe.shape
-    pe = np.reshape(pe, (year * row * col, -1))
-    pe = (pe - np.mean(pe, axis=0)) / (np.std(pe, axis=0) + 1e-8)
-    pe = np.reshape(pe, (year, row, col, -1))
-    pe = torch.tensor(pe, dtype=torch.float32)
 
-    with h5py.File(PATH["landuse_and_poi"], "r") as h5f:
-        lp = h5f["features"][..., [item for item in DATA['landuse_poi']]]
-    lp = np.reshape(lp, (row * col, -1))
-    lp = (lp - np.mean(lp, axis=0)) / (np.std(lp, axis=0) + 1e-8)
-    lp = np.reshape(lp, (row, col, -1))
-    lp = torch.tensor(lp, dtype=torch.float32)
-    lp = lp.unsqueeze(0).expand(year, -1, -1, -1)  # broadcast
-    grid_features = torch.cat([pe, lp], dim=-1)
-    grid_features = grid_features[-1, ...]  # year 2022
-    print(f"Grid features shape {grid_features.shape}")
+    parts = []
 
-    return grid_features
+    # 1) population
+    pop_level_key = DATA.get('population_level', 'lv3')
+    if isinstance(rec.get('population'), dict):
+        parts.extend(float(x) for x in rec['population'].get(pop_level_key, []))
 
-def load_mesh_cells():
-    grid_cells = gpd.read_file(os.path.join(PATH['grid']))
+    # 2) employment
+    emp_level_key = DATA.get('employment_level', 'lv3')
+    if isinstance(rec.get('employment'), dict):
+        parts.extend(float(x) for x in rec['employment'].get(emp_level_key, []))
 
-    if grid_cells.crs is None:
-        raise ValueError("Grid cells shapefile does not have a CRS defined.")
+    # 3) households (optional level string)
+    hh_level_key = DATA.get('households_level', 'lv3')
+    if hh_level_key and isinstance(rec.get('households'), dict):
+        parts.extend(float(x) for x in rec['households'].get(hh_level_key, []))
 
-    if grid_cells.crs.to_epsg() != 27700:
-        raise ValueError("The CRS of the shapefile is not EPSG:27700.")
+    # 4) area + pop density (optional)
+    if DATA.get('use_population_density', False):
+        parts.extend(float(x) for x in rec.get('area_popdensity', []) or [])
 
-    return grid_cells
+    # 5) land use (optional)
+    if DATA.get('use_land_use', False):
+        parts.extend(float(x) for x in rec.get('land_use', []) or [])
 
-def get_pixel_coordinates(grid_cells, indices):
-    pixel_coords = np.array([(grid_cells.geometry.iloc[i].centroid.x, grid_cells.geometry.iloc[i].centroid.y) for i in indices])
-    return torch.tensor(pixel_coords, dtype=torch.float32)  # (N, 2)
+    # 6) POI (optional)
+    if DATA.get('use_poi', False):
+        parts.extend(float(x) for x in rec.get('poi', []) or [])
+
+    # 7) IMD (optional)
+    if DATA.get('use_imd', False):
+        parts.extend(float(x) for x in rec.get('imd', []) or [])
+
+    return torch.tensor(parts, dtype=torch.float32)
+
+def load_seq_npy(npy_path):
+    """
+    Load a path feature npy for a node. Returns 2D array [steps, feat_dim].
+    Assumes features are already normalized (one-hot + derived), as produced earlier.
+    """
+    arr = np.load(npy_path, mmap_mode="r")
+    if arr.ndim != 2:
+        raise ValueError(f"Bad array shape in {npy_path}: {arr.shape}")
+    return arr
+
+def make_pair_sequence(arr_O, arr_D):
+    """
+    Build the OD sequence for GRU:
+      - Reverse O sequence to get forward travel
+      - D sequence is forward; drop its first row to avoid duplicating the ego edge
+      - Concatenate [O_rev ; D_fwd[1:]]
+    Return float32 tensor [T, F]
+    """
+    O_rev = arr_O[::-1, :]
+    D_fwd = arr_D
+    if len(D_fwd) > 0:
+        D_fwd = D_fwd[1:, :]  # drop first step to avoid ego-edge duplication
+    seq = np.concatenate([O_rev, D_fwd], axis=0)
+    return torch.tensor(seq, dtype=torch.float32)
+
 
 def load_gt():
-    gt_df = pd.read_csv(PATH["ground_truth"])
+    """
+    Load GT traffic volume from a simple JSON mapping {edge_id: volume}.
+    TODO: Intersect with edges that have >0 valid OD pairs per od_pairs_stats.json (current)
+    Normalize using Scaler and return:
+      - edge_to_gt: {edge_id: normalized_value}
+      - scaler: fitted Scaler on raw volumes
+    """
+    # Load JSON
+    with open("data/traffic_volume/GT_2022_car.json", "r") as f:
+        gt_data = json.load(f)
+    with open("data/subgraphs/od_pairs_stats.json", "r") as f:
+        stats_raw = json.load(f)
 
-    edge_ids = gt_df["edge_id"].values
-    traffic_volume = gt_df["Traffic Volume"].values.astype(float)
+    valid_ids = {eid for eid, cnt in stats_raw.items() if int(cnt) > 0}
+    filtered_items = [(eid, float(vol)) for eid, vol in gt_data.items() if eid in valid_ids]
 
-    traffic_volume_tensor = torch.tensor(traffic_volume, dtype=torch.float32)
-    scaler = Scaler(traffic_volume_tensor)
-    traffic_volume_normalized = scaler.transform(traffic_volume_tensor)
+    print(f"Number of valid edges: {len(filtered_items)}")
+    edge_ids, volumes = zip(*filtered_items)
 
-    edge_to_gt = {str(eid): val for eid, val in zip(edge_ids, traffic_volume_normalized.cpu().numpy())}
+    # Torch tensor + normalization
+    traffic_volume_tensor = torch.tensor(volumes, dtype=torch.float32, device=TRAINING['device'])
+    if TRAINING['normalize']:
+        scaler = ScalerMinMax(traffic_volume_tensor)
+        traffic_volume_tensor = scaler.transform(traffic_volume_tensor)
+    else:
+        scaler = None
+
+    # Build mapping {edge_id: normalized_value}
+    edge_to_gt = {
+        eid: float(val) for eid, val in zip(edge_ids, traffic_volume_tensor.cpu().numpy())
+    }
 
     return edge_to_gt, scaler

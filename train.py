@@ -5,56 +5,150 @@ import logging
 import datetime
 import random
 
-from config import PATH, DATA, TRAINING
-from model.mukara import Mukara  # subgraph-based PyTorch+DGL model
-from model.dataloader import load_gt
+from config import DATA, TRAINING
+from model.mukara import Mukara
+from model.dataloader import load_gt, load_json, get_lsoa_vector
 import model.utils as utils
 
+
 class MukaraTrainer:
+    """
+    Adds:
+      • Staged LR schedule: [1e-3, 1e-4, 1e-5]
+      • Early stopping per LR stage on Validation MGEH
+      • "Minimum improvement" = 0.1 (absolute decrease in MGEH)
+      • Save best weights-only checkpoint for EACH LR stage
+        right before we drop LR (and also for the final 1e-5 stage).
+      • Patience counted in *evaluation steps*: 10
+    """
+
     def __init__(self):
         # Set random seeds
         np.random.seed(TRAINING['seed'])
         torch.manual_seed(TRAINING['seed'])
         random.seed(TRAINING['seed'])
-        
-        self.device = torch.device("cuda" if (TRAINING['use_gpu'] and torch.cuda.is_available()) else "cpu")
-        print(self.device)
+
+        self.device = torch.device(TRAINING['device'])
 
         # Logging
+        os.makedirs('eval/logs', exist_ok=True)
         logging.basicConfig(
-            filename=os.path.join(PATH["evaluate"], 'training_log.log'),
+            filename='eval/logs/training_log.log',
             level=logging.INFO,
             format='%(asctime)s:%(levelname)s:%(message)s',
             filemode='w'
         )
 
+        # ------ preload node features once (optionally PCA) -------
+        lsoa_json = load_json("data/node_features/lsoa21_features_normalized.json")
+        node_to_lsoa = load_json("data/node_features/node_to_lsoa.json")
+
+        # build a deterministic ordering of LSOAs
+        lsoa_codes = sorted(lsoa_json.keys())
+        # stack raw feature matrix
+        feat_rows = []
+        for code in lsoa_codes:
+            v = get_lsoa_vector(lsoa_json[code])  # torch tensor 1D
+            feat_rows.append(v.cpu().numpy())
+        X = np.vstack(feat_rows).astype(np.float32)  # (N_lsoa, F_raw)
+
+        feature_bank = {}    # {lsoa_code: torch.tensor(feature_dim,)}
+
+        if TRAINING.get("pca", False):
+            k = int(TRAINING.get("pca_components", 32))
+            Xp, mean, comps = utils.pca_project(X, k)
+            # store projected vectors
+            for i, code in enumerate(lsoa_codes):
+                feature_bank[code] = torch.from_numpy(Xp[i])  # CPU tensor; model moves to device
+            # (optional) persist PCA model for reuse/repro
+            os.makedirs("data/node_features", exist_ok=True)
+            np.savez("data/node_features/pca_model_lsoa21.npz",
+                     mean=mean, components=comps, codes=np.array(lsoa_codes, dtype=object))
+            logging.info(f"PCA enabled: raw_dim={X.shape[1]}, k={k}")
+            print(f"[PCA] raw_dim={X.shape[1]} -> k={k}; saved pca_model_lsoa21.npz")
+        else:
+            # keep original feature vectors
+            for i, code in enumerate(lsoa_codes):
+                feature_bank[code] = torch.from_numpy(X[i])
+
         # Initialize model and optimizer
-        self.model = Mukara().to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=TRAINING['lr'])
+        self.model = Mukara(feature_bank=feature_bank, node_to_lsoa=node_to_lsoa).to(self.device)
+
+        # LR schedule (staged)
+        self.lr_stages = [1e-3, 1e-4, 1e-5]
+        self.current_stage_idx = 0
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr_stages[self.current_stage_idx], weight_decay = 1e-4)
+
+        # Load checkpoint if provided
+        ckpt_path = TRAINING.get("checkpoint")
+        if ckpt_path and os.path.isfile(ckpt_path):
+            logging.info(f"Loading model weights from {ckpt_path}")
+            print(f"Loading model weights from {ckpt_path}")
+            state_dict = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+            self.model.load_state_dict(state_dict)
 
         # Load GT and split
         self.edge_to_gt, self.scaler = load_gt()
-        self.model.z_shift = (-self.scaler.mean / (self.scaler.std + 1e-8)).item()
         self.all_edge_ids = list(self.edge_to_gt.keys())
-        self.train_ids, self.val_ids = utils.train_test_sampler(self.all_edge_ids, TRAINING['train_prop'])
+        self.train_ids, self.val_ids = utils.train_test_sampler(self.all_edge_ids)
+
+        # Early stopping config (on Validation MGEH)
+        self.patience_steps = 10                       # evaluations without sufficient improvement
+        self.min_improve = 0.1                         # absolute MGEH improvement required
+        self.eval_interval = TRAINING['eval_interval'] # evaluations cadence (in training steps)
+
+        # Metric tracking (per stage)
+        self.best_val_geh = float('inf')
+        self.best_state_dict = None
+        self.steps_since_improve = 0
+        self.total_eval_calls_in_stage = 0
+
+        logging.info(f"LR schedule: {self.lr_stages}")
+
+    # ------------------------- helpers -------------------------
+
+    def _set_lr(self, lr: float):
+        for g in self.optimizer.param_groups:
+            g['lr'] = lr
+        logging.info(f"LR set to {lr:.6g}")
+        print(f"[LR] set to {lr:.6g}")
+
+    def _save_best_for_stage(self):
+        """Save the best weights (if any) for the current LR stage."""
+        if self.best_state_dict is None:
+            return
+        lr = self.lr_stages[self.current_stage_idx]
+        os.makedirs("param/best", exist_ok=True)
+        path = f"param/best/best_stage_{self.current_stage_idx+1}_lr{lr:.0e}.pt"
+        torch.save(self.best_state_dict, path)
+        logging.info(f"Saved BEST model for stage {self.current_stage_idx+1} (lr={lr:.0e}) to {path}")
+        print(f"[BEST] Saved best for stage {self.current_stage_idx+1} (lr={lr:.0e}) -> {path}")
+
+    def _reset_stage_trackers(self):
+        self.best_val_geh = float('inf')
+        self.best_state_dict = None
+        self.steps_since_improve = 0
+        self.total_eval_calls_in_stage = 0
 
     def compute_loss(self, gt, pred, loss_function):
         return getattr(utils, loss_function)(gt, pred, self.scaler)
 
+    # ------------------------- core -------------------------
+
     def train_model(self):
+        counter = 0
+        # ensure starting LR
+        self._set_lr(self.lr_stages[self.current_stage_idx])
+
         for epoch in range(TRAINING['epoch']):
             logging.info(f"Epoch {epoch} started.")
-            self.model.train()
             random.shuffle(self.train_ids)
 
-            total_loss = 0.0
-            train_preds, train_gts = [], []
-
             for step, edge_id in enumerate(self.train_ids):
+                counter += 1
+                self.model.train()
                 gt = self.edge_to_gt[edge_id]
                 pred = self.model(edge_id)
-                if pred is None or pred.numel() == 0:
-                    continue
 
                 gt_tensor = torch.tensor([gt], dtype=torch.float32, device=self.device)
                 pred = pred.to(self.device)
@@ -62,86 +156,150 @@ class MukaraTrainer:
                 loss = self.compute_loss(gt_tensor, pred, TRAINING['loss_function'])
                 self.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), TRAINING['clip_gradient'])
+                if TRAINING['clip_gradient']:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), TRAINING['clip_gradient'])
                 self.optimizer.step()
 
-                train_preds.append(pred.detach())
-                train_gts.append(gt_tensor)
-                total_loss += loss.item()
+                # mse = utils.MSE(gt_tensor, pred, self.scaler).item()
+                # mae = utils.MAE(gt_tensor, pred, self.scaler).item()
+                # geh = utils.MGEH(gt_tensor, pred, self.scaler).item()
 
-                mse_z = utils.MSE_Z(gt_tensor, pred, self.scaler).item()
-                mae = utils.MAE(gt_tensor, pred, self.scaler).item()
-                geh = utils.MGEH(gt_tensor, pred, self.scaler).item()
-
-                real_gt = self.scaler.inverse_transform(gt_tensor).item()
-                real_pred = self.scaler.inverse_transform(pred).item()
-                logging.info(
-                    f"Epoch {epoch} Step {step}: Train Edge {edge_id}, MSE_Z: {mse_z:.6f}, MAE: {mae:.2f}, GEH: {geh:.2f}, "
-                    f"GT: {real_gt:.2f}, Pred: {real_pred:.2f}"
-                )
+                # real_gt = self.scaler.inverse_transform(gt_tensor).item() if self.scaler else gt_tensor.item()
+                # real_pred = self.scaler.inverse_transform(pred).item() if self.scaler else pred.item()
+                # logging.info(
+                #     f"Epoch {epoch} Step {step}: Train Edge {edge_id}, MSE: {mse:.6f}, MAE: {mae:.2f}, MGEH: {geh:.2f}, "
+                #     f"GT: {real_gt:.2f}, Pred: {real_pred:.2f}"
+                # )
 
                 # Evaluation interval
-                if (step + 1) % TRAINING['eval_interval'] == 0:
-                    self.evaluate_random_sample(epoch, step)
+                if counter % self.eval_interval == 0:
+                    metrics = self.evaluate_random_sample(epoch, step)
+                    if metrics is None:
+                        continue
+                    val_geh = metrics['val_geh']
+                    self.total_eval_calls_in_stage += 1
+
+                    # Early stopping criterion on MGEH (lower is better):
+                    # consider it an improvement only if MGEH decreased by at least self.min_improve
+                    if (self.best_val_geh - val_geh) >= self.min_improve:
+                        self.best_val_geh = val_geh
+                        # store CPU state_dict for a clean, weights-only save
+                        self.best_state_dict = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+                        self.steps_since_improve = 0
+                        logging.info(f"[IMPROVED] Stage {self.current_stage_idx+1} best_val_MGEH={self.best_val_geh:.6f}")
+                    else:
+                        self.steps_since_improve += 1
+                        logging.info(
+                            f"[NO-IMPROVE] {self.steps_since_improve}/{self.patience_steps} "
+                            f"(Delta={self.best_val_geh - val_geh:.6f}, min_improve={self.min_improve})"
+                        )
+
+                    # Early stopping for this LR stage
+                    if self.steps_since_improve >= self.patience_steps:
+                        # Save best for this stage before dropping LR
+                        self._save_best_for_stage()
+
+                        # Move to next LR stage; if done with last stage, exit
+                        if self.current_stage_idx + 1 >= len(self.lr_stages):
+                            print("[EARLY STOP] Final stage reached and patience exhausted. Training stops.")
+                            logging.info("Final LR stage patience exhausted. Stopping training.")
+                            return
+                        else:
+                            # advance stage
+                            self.current_stage_idx += 1
+                            self._set_lr(self.lr_stages[self.current_stage_idx])
+                            # reset trackers for new stage
+                            self._reset_stage_trackers()
+                            logging.info(f"Entering LR stage {self.current_stage_idx+1}/{len(self.lr_stages)}.")
 
             # Final evaluation at end of epoch
-            self.evaluate_random_sample(epoch, 'end')
+            # self.evaluate_random_sample(epoch, 'end')
+            # self.save_model(epoch)
+
+        # Finished all epochs; also save best of final stage if any
+        self._save_best_for_stage()
+        logging.info("Training finished (max epochs reached).")
 
     def evaluate_random_sample(self, epoch, step):
         self.model.eval()
         with torch.no_grad():
-            sample_train = random.sample(self.train_ids, min(TRAINING['eval_sample'], len(self.train_ids)))
-            sample_val = random.sample(self.val_ids, min(TRAINING['eval_sample'], len(self.val_ids)))
+            sample_train = random.sample(self.train_ids, min(TRAINING['eval_sample_train'], len(self.train_ids)))
+            sample_val = random.sample(self.val_ids, min(TRAINING['eval_sample_eval'], len(self.val_ids)))
 
-            for split, sample_ids in [('Train', sample_train), ('Validation', sample_val)]:
-                preds, gts = [], []
-                for edge_id in sample_ids:
-                    gt = self.edge_to_gt[edge_id]
-                    pred = self.model(edge_id)
-                    if pred is None or pred.numel() == 0:
-                        continue
-                    preds.append(pred)
-                    gts.append(torch.tensor([gt], dtype=torch.float32, device=self.device))
+            # ----- Training subset (for logging only) -----
+            preds, gts = [], []
+            for edge_id in sample_train:
+                gt = self.edge_to_gt[edge_id]
+                pred = self.model(edge_id)
+                if pred is None or pred.numel() == 0:
+                    continue
+                preds.append(pred.unsqueeze(0))
+                gts.append(torch.tensor([gt], dtype=torch.float32, device=self.device))
+            if preds and gts:
+                preds_t = torch.cat(preds)
+                gts_t = torch.cat(gts)
+                train_mae = utils.MAE(gts_t, preds_t, self.scaler).item()
+                train_geh = utils.MGEH(gts_t, preds_t, self.scaler).item()
+                train_rmse = utils.RMSE(gts_t, preds_t, self.scaler).item()
+                train_r2 = utils.R_square(gts_t, preds_t, self.scaler).item()
+                logging.info(
+                    f"Epoch {epoch} Step {step} Train Eval: "
+                    f"RMSE: {train_rmse:.6f}, MAE: {train_mae:.6f}, MGEH: {train_geh:.6f}, "
+                    f"R2: {train_r2:.6f}"
+                )
 
-                if preds:
-                    preds = torch.cat(preds)
-                    gts = torch.cat(gts)
+            # ----- Validation subset (used for early stopping) -----
+            preds, gts = [], []
+            for edge_id in sample_val:
+                gt = self.edge_to_gt[edge_id]
+                pred = self.model(edge_id)
+                if pred is None or pred.numel() == 0:
+                    continue
+                preds.append(pred.unsqueeze(0))
+                gts.append(torch.tensor([gt], dtype=torch.float32, device=self.device))
 
-                    mse_z = utils.MSE_Z(gts, preds, self.scaler).item()
-                    mae = utils.MAE(gts, preds, self.scaler).item()
-                    geh = utils.MGEH(gts, preds, self.scaler).item()
+            if not preds or not gts:
+                logging.warning("Empty predictions during evaluation; skipping metrics.")
+                return None
 
-                    logging.info(
-                        f"Epoch {epoch} Step {step} {split} Eval: MSE_Z: {mse_z:.6f}, MAE: {mae:.6f}, GEH: {geh:.6f}"
-                    )
+            preds_t = torch.cat(preds)
+            gts_t = torch.cat(gts)
 
+            val_rmse = utils.RMSE(gts_t, preds_t, self.scaler).item()
+            val_mae = utils.MAE(gts_t, preds_t, self.scaler).item()
+            val_geh = utils.MGEH(gts_t, preds_t, self.scaler).item()
+            val_r2 = utils.R_square(gts_t, preds_t, self.scaler).item()
+
+            logging.info(
+                f"Epoch {epoch} Step {step} Validation Eval: "
+                f"RMSE: {val_rmse:.6f}, MAE: {val_mae:.6f}, MGEH: {val_geh:.6f}, "
+                f"R2: {val_r2:.6f} "
+                f"(stage {self.current_stage_idx+1}/{len(self.lr_stages)}, lr={self.lr_stages[self.current_stage_idx]:.0e})"
+            )
+
+            return {
+                'val_mse': val_rmse,
+                'val_mae': val_mae,
+                'val_geh': val_geh,
+                'val_r2': val_r2
+            }
 
     def save_model(self, epoch):
         formatted_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        model_filename = os.path.join(PATH["param"], f"epoch{epoch}_{formatted_time}.pt")
+        os.makedirs("param", exist_ok=True)
+        os.makedirs(f"param/temp", exist_ok=True)
+        model_filename = f"param/temp/epoch{epoch}_{formatted_time}.pt"
         torch.save(self.model.state_dict(), model_filename)
         print("Model saved successfully.")
 
-    def cleanup_and_log_config(self):
-        if DATA['clear_cache']:
-            for filename in os.listdir(PATH['cache']):
-                os.remove(os.path.join(PATH['cache'], filename))
-
-        for handler in logging.root.handlers[:]:
-            handler.close()
-            logging.root.removeHandler(handler)
-
-        with open('config.py', 'r') as config_file:
-            config_content = config_file.read()
-
-        with open(os.path.join(PATH["evaluate"], "training_log.log"), 'a') as log_file:
-            log_file.write('\n\n# Contents of config.py\n')
-            log_file.write(config_content)
 
 if __name__ == '__main__':
     print("Initiating model...")
     trainer = MukaraTrainer()
+
     print("Training started...")
     trainer.train_model()
-    trainer.save_model('final')
-    trainer.cleanup_and_log_config()
+
+    for handler in logging.root.handlers[:]:
+        handler.close()
+        logging.root.removeHandler(handler)

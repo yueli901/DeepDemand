@@ -5,6 +5,7 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 
+from model.dataloader import load_json, get_lsoa_vector
 from config import DATA, MODEL, TRAINING
 
 class MLP(nn.Module):
@@ -21,12 +22,13 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class DistanceProbLinear(nn.Module):
+class DistanceProb(nn.Module):
     """
     Learn p(use ego | distance) from a scalar distance (e.g., t_OD seconds).
     """
-    def __init__(self):
+    def __init__(self, quadratic: bool = True):
         super().__init__()
+        self.quadratic = quadratic
 
         self.register_buffer("mu", torch.tensor(MODEL["t_mean"], dtype=torch.float32))
         self.register_buffer("s",  torch.tensor(MODEL["t_std"],  dtype=torch.float32))
@@ -34,40 +36,18 @@ class DistanceProbLinear(nn.Module):
         # logistic weights
         self.alpha = nn.Parameter(torch.zeros(()))
         self.beta  = nn.Parameter(torch.ones(()))
-
+        if quadratic:
+            self.beta2 = nn.Parameter(torch.zeros(()))
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, d: torch.Tensor) -> torch.Tensor:
         # d: [N] (float, seconds)
-        if MODEL['t_normalize']:
-            d = (d - self.mu) / (self.s.abs() + 1e-6)
-        logit = self.alpha + self.beta * d
+        z = (d - self.mu) / (self.s.abs() + 1e-6)
+        if self.quadratic:
+            logit = self.alpha + self.beta * z + self.beta2 * (z * z)
+        else:
+            logit = self.alpha + self.beta * z
         return self.sigmoid(logit)  # [N]
-    
-class DistanceProbMLP(nn.Module):
-    """
-    Learn p(use ego | distance) from a scalar distance (t, e.g., seconds)
-    using a general MLP followed by a sigmoid.
-    """
-    def __init__(self):
-        super().__init__()
-
-        # normalization buffers (same idea as DistanceProbLinear)
-        self.register_buffer("mu", torch.tensor(MODEL["t_mean"], dtype=torch.float32))
-        self.register_buffer("s",  torch.tensor(MODEL["t_std"],  dtype=torch.float32))
-
-        # use your existing MLP class
-        self.mlp = MLP(1, MODEL["t_hidden"], 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, d: torch.Tensor) -> torch.Tensor:
-        # d: [N] (float, seconds)
-        if MODEL["t_normalize"]:
-            d = (d - self.mu) / (self.s.abs() + 1e-6)
-        d = d.view(-1, 1)  # ensure shape [N, 1] for the MLP
-        logits = self.mlp(d).squeeze(-1)
-        return self.sigmoid(logits)  # [N]
-
 
 class Mukara(nn.Module):
     """
@@ -81,36 +61,27 @@ class Mukara(nn.Module):
         node_features/node_to_lsoa.json            # mapping node_id(str) -> LSOA code(str)
     """
 
-    def __init__(self, feature_bank: Dict[str, torch.Tensor] = None,
-                 node_to_lsoa: Dict[str, list] = None):
+    def __init__(self):
         super().__init__()
         self.device = TRAINING['device']
 
-        # ---------------- feature store ----------------
-        # precomputed (raw or PCA) features are supplied by trainer
-        self._feature_bank_cpu: Dict[str, torch.Tensor] = feature_bank  # CPU tensors
-        self.node_to_lsoa = node_to_lsoa
-        # infer dim from first entry
-        any_code = next(iter(self._feature_bank_cpu.keys()))
-        lsoa_dim = int(self._feature_bank_cpu[any_code].numel())
-        print(f"LSOA feature dim (preloaded): {lsoa_dim}")
+        # Load LSOA features once to know dims
+        self.lsoa_json = load_json("data/node_features/LSOA_features_normalized.json")
+        self.node_to_lsoa = load_json("data/node_features/node_to_lsoa.json")
         self._feat_cache: Dict[str, torch.Tensor] = {}
 
-        # ---------------- encoders & heads ----------------
+        # Build one example vector to infer input dim
+        any_lsoa = next(iter(self.lsoa_json.values()))
+        lsoa_dim = len(get_lsoa_vector(any_lsoa))
+
         # Node encoders (two towers; independent parameters)
         self.enc_O = MLP(lsoa_dim, MODEL['node_hidden'], MODEL['node_out'])
         self.enc_D = MLP(lsoa_dim, MODEL['node_hidden'], MODEL['node_out'])
 
         # Pair scorer (maps concat of two node embeddings to a non-negative scalar)
-        pair_in = MODEL['node_out'] * 2
+        pair_in = MODEL['node_out'] * 2 + 1
         self.pair_head = MLP(pair_in, MODEL['pair_hidden'], 1)
         self.pair_activation = nn.Softplus()  # non-negative scalar
-
-        self.dist_head = DistanceProbLinear()        # Distance-only probability head
-
-        # global scale
-        self.agg_scale = nn.Parameter(torch.tensor(100.0))  # learnable > 0 via Softplus if you prefer
-        # self.alpha_N = nn.Parameter(torch.tensor(0.5))   # learns how much N should matter
 
     def _get_feature_tensor(self, node_id_str: str) -> torch.Tensor:
         """Return node feature tensor on device, cached."""
@@ -119,8 +90,8 @@ class Mukara(nn.Module):
             return t
         # build once
         lsoa_code = self.node_to_lsoa[str(node_id_str)][0]
-        vec = self._feature_bank_cpu[lsoa_code]                # CPU tensor (1D)
-        t = vec.to(self.device)  
+        rec = self.lsoa_json[lsoa_code]
+        t = get_lsoa_vector(rec).to(self.device)   # 1D tensor on device
         self._feat_cache[node_id_str] = t
         return t
 
@@ -146,7 +117,7 @@ class Mukara(nn.Module):
         # === Chunked processing ===
         chunk_size = MODEL["chunk_size"]
         N = len(df)
-        sum_contrib = torch.zeros((), device=self.device)
+        total_volume = torch.zeros((), device=self.device)
 
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
@@ -170,17 +141,12 @@ class Mukara(nn.Module):
             D_emb = D_emb_u[torch.from_numpy(inv_D).to(self.device)]
 
             # ---- Pair scorer (chunk) ----
-            pair_in = torch.cat([O_emb, D_emb], dim=1)               # [B, 2d]
+            t_ODs = t_ODs.unsqueeze(1) 
+            pair_in = torch.cat([O_emb, D_emb, t_ODs], dim=1)               # [B, 2d+1]
             z_pair  = self.pair_head(pair_in).squeeze(-1)            # [B]
             s_pair  = self.pair_activation(z_pair)                   # [B] ≥ 0
 
-            # ---- Distance-based probability (chunk) ----
-            p_dist  = self.dist_head(t_ODs)                          # [B] in (0,1)
-
             # ---- Accumulate (keeps gradient graph across chunks) ----
-            sum_contrib = sum_contrib + torch.sum(s_pair * p_dist) # scalar
-        
-        # mean_contrib = sum_contrib / N
-        # pred =  mean_contrib * torch.sqrt(torch.tensor(N, device=self.device))
-        pred = self.agg_scale * torch.sqrt(sum_contrib)
-        return pred
+            total_volume = total_volume + torch.sum(s_pair) # scalar
+
+        return torch.sqrt(total_volume) #* torch.tensor(0.00001, device=self.device) #self.global_scale.abs()
