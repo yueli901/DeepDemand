@@ -1,0 +1,49 @@
+# Ignore macOS system files
+.DS_Store
+
+# Ignore Python compiled files
+*.pyc
+__pycache__/
+
+# 
+.vscode/
+
+# Ignore log files
+*.log
+
+# Ignore folders
+manuscript/
+data/basemap
+deprecated/
+
+# data files
+*.cpg
+*.dbf
+*.prj
+*.shp
+*.shx
+*.xml
+*.txt
+*.gpkg
+*.kmz
+*.cfg
+
+*.npz
+*.npy
+
+*.h5
+*.pt
+*.json
+*.geojson
+*.gpickle
+
+*.csv
+*.xlsx
+*.ods
+
+*.pbf
+*.html
+*.log
+*.zip
+
+*.png
