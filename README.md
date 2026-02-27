@@ -1,8 +1,8 @@
 # DeepDemand  
 ## Interpretable Long-Term Traffic Modelling on National Road Networks Using Theory-Informed Deep Learning
 
-![Local OD extraction and OD pair screening](manuscript/images/DeepDemand1.png)  
-![Architecture of DeepDemand](manuscript/images/DeepDemand2.png)
+![Local OD extraction and OD pair screening](manuscript/figures/DeepDemand1.png)  
+![Architecture of DeepDemand](manuscript/figures/DeepDemand2.png)
 
 DeepDemand is a theory-informed deep learning framework for long-term, interpretable traffic volume modelling on national road networks.  
 This repository provides the official PyTorch implementation accompanying the paper:
