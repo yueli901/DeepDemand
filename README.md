@@ -63,7 +63,7 @@ This directory contains scripts for constructing the complete modelling dataset:
 > **Important**  
 > Raw datasets are not stored in this repository.  
 > All primary data sources are open-access and should be downloaded from their official providers.  
-> Essential processed datasets required for training are hosted on the University of Cambridge Apollo repository.  
+> Essential processed datasets used for model training are publicly available via the University of Cambridge Apollo repository (DOI: https://doi.org/10.17863/CAM.127892). 
 > Additional large files can be provided upon request.
 
 ### `highway_network/`
