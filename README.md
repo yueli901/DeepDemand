@@ -57,7 +57,7 @@ This directory contains scripts for constructing the complete modelling dataset:
 
 1. Highway network extraction and simplification  
 2. Node-level socioeconomic feature engineering  
-3. Edge-centric local OD subgraph generation  
+3. Local OD region extraction and OD pair screening  
 4. Traffic volume aggregation  
 
 > **Important**  
@@ -100,12 +100,15 @@ Final feature banks:
 
 ### `subgraphs/`
 
-- `subgraph_generation.ipynb`:
-  - Extracts edge-centric OD regions
-- `HPC/`:
-  - Valid OD pair screening scripts
-- Output:
-  - Per-edge OD sets stored in `od_use.feather`
+Builds, for every target edge, the set of OD pairs whose fastest route uses that edge.
+
+- `build_csr_graph.py` — converts the driving graph to CSR arrays for parallel shortest-path work
+- `build_reach_tree.py` — shortest travel times between centroid nodes within a cutoff
+- `competitive_partition.py` — competitive origin/destination partition of each edge's local region
+- `screen_od_pairs.py` — shortest-path screening, written directly as the per-edge OD index cache
+
+A catchment radius of `tau` requires a reachability cutoff of `2*tau`, since a screened pair
+satisfies `t_O + t_e + t_D = t_OD` with both sides bounded by `tau`.
 
 ---
 
@@ -120,12 +123,16 @@ Final feature banks:
 
 ---
 
-## `model/` — Model and Baselines
+## `model/` — Model, Ablations and Baselines
 
-- `deepdemand.py` — DeepDemand architecture  
-- `dataloader.py` — Data loading utilities  
-- `utils.py` — Metrics and splitting  
-- `baseline_*.py` — Benchmark models  
+- `deepdemand.py` — DeepDemand architecture
+- `od_cache.py` — per-edge OD index cache read during training
+- `dataloader.py` — data loading utilities
+- `utils.py` — metrics and splitting
+- `ablation_models.py` — component ablations (shared encoder, constant deterrence, linear aggregation)
+- `ablation_od_structure.py` — pooled-zone versus OD-structured features
+- `sensitivity_aggregation.py` — sensitivity to the multi-year aggregation of the ground truth
+- `baseline_*.py` — mean, OLS, ridge, gravity, random forest, XGBoost, LightGBM, GAT
 
 ---
 
@@ -136,6 +143,7 @@ Final feature banks:
 - `cv.ipynb` — Random CV metric summaries  
 - `spatial_cv.ipynb` — Spatial CV summaries  
 - `evaluate_log.py` — Log parser  
+- `cv_report.py`, `spatial_cv_report.py`, `ablation_report.py` — metric tables across folds  
 - Residual analysis and visualisation scripts  
 
 ---
@@ -155,43 +163,45 @@ Final feature banks:
 - `param/` — Trained model weights  
 - `projection/` — Long-term projection scripts (e.g., 2040 scenarios)  
 - `config.py` — Hyperparameter configuration  
-- `config-template.py` — Template for batch experiments  
 - `train.py` — Random cross-validation training  
 - `train_spatial_cv.py` — Spatial cross-validation training  
-- `train_multiple_models.ipynb` — Batch experiment automation  
+- `run_cv.sh`, `run_spatial_cv.sh`, `run_baselines.sh`, `run_ablation.sh` — fold and experiment drivers  
 
 ---
 
-# 3. Training Workflow
+# 3. Workflow
 
-## Single Model (Random CV)
-
-1. Modify hyperparameters in `config.py`
-2. Run:
+## Preprocessing
 
 ```bash
-python train.py
+python data/subgraphs/build_csr_graph.py
+python data/subgraphs/build_reach_tree.py --cutoff 7200 --out data/subgraphs/reach_2h
+python data/subgraphs/competitive_partition.py --build-transpose
+python data/subgraphs/competitive_partition.py --run --cutoff 3600 \
+    --out data/subgraphs/subgraphs --workers 8
+python data/subgraphs/screen_od_pairs.py --run --meta data/subgraphs/subgraphs --tau 3600 \
+    --out data/subgraphs/od_index_cache --workers 8
 ```
 
----
+`--workers` should be set to the number of available cores. Pass `--emit-od-use` to the final
+step to also export the per-edge OD pair table, which the feature-based baselines read.
 
-## Spatial Cross-Validation
+## Training
 
 ```bash
-python train_spatial_cv.py
+python train.py                 # random cross-validation
+python train_spatial_cv.py      # spatial cross-validation
 ```
 
----
+`CV_TYPE`, `CV_FOLD` and `RUN_NAME` select the protocol, the held-out fold and the output name.
+`MODEL_VARIANT` selects a component ablation. The driver scripts run the full set of folds:
 
-## Batch Experiments
-
-Use:
-
+```bash
+bash run_cv.sh
+bash run_spatial_cv.sh
+bash run_baselines.sh
+bash run_ablation.sh
 ```
-train_multiple_models.ipynb
-```
-
-to automate multiple configurations sequentially.
 
 ---
 

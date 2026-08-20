@@ -82,9 +82,23 @@ class DeepDemand(nn.Module):
     """
 
     def __init__(self, feature_bank: Dict[str, torch.Tensor] = None,
-                 node_to_lsoa: Dict[str, list] = None):
+                 node_to_lsoa: Dict[str, list] = None,
+                 od_cache=None, feature_matrix: torch.Tensor = None,
+                 shared_encoder: bool = False):
         super().__init__()
         self.device = TRAINING['device']
+
+        # P0 speedup (optional). When both are provided, forward() uses the cache
+        # fast path (no per-step feather read); otherwise it falls back to reading
+        # od_use.feather. self.F is the [n_lsoa, dim] feature matrix on device,
+        # rows ordered by sorted(lsoa_codes) -- the same order od_cache indexes into.
+        self.od_cache = od_cache
+        self.F = feature_matrix.to(self.device) if feature_matrix is not None else None
+        # dense node index -> LSOA feature row (on device); used by the cache fast path
+        self.dense_to_row = (
+            torch.as_tensor(od_cache.dense_to_row, dtype=torch.long, device=self.device)
+            if od_cache is not None else None
+        )
 
         # ---------------- feature store ----------------
         # precomputed (raw or PCA) features are supplied by trainer
@@ -97,9 +111,12 @@ class DeepDemand(nn.Module):
         self._feat_cache: Dict[str, torch.Tensor] = {}
 
         # ---------------- encoders & heads ----------------
-        # Node encoders (two towers; independent parameters)
+        # Node encoder. DEFAULT = two INDEPENDENT towers for origins and destinations (enc_O and
+        # enc_D) -- the reported model, unchanged from the first submission. Tying them into a single
+        # shared tower does not affect accuracy and is the AblationSharedEncoder variant
+        # (shared_encoder=True).
         self.enc_O = MLP(lsoa_dim, MODEL['node_hidden'], MODEL['node_out'])
-        self.enc_D = MLP(lsoa_dim, MODEL['node_hidden'], MODEL['node_out'])
+        self.enc_D = self.enc_O if shared_encoder else MLP(lsoa_dim, MODEL['node_hidden'], MODEL['node_out'])
 
         # Pair scorer (maps concat of two node embeddings to a non-negative scalar)
         pair_in = MODEL['node_out'] * 2
@@ -128,58 +145,98 @@ class DeepDemand(nn.Module):
         """Stack cached feature tensors for a list of node ids (keeps order)."""
         return torch.stack([self._get_feature_tensor(nid) for nid in node_ids], dim=0)
 
+    def _aggregate(self, S, eps=0.0):
+        """Final monotonic transform from the summed OD score S to a flow. Overridden by the
+        linear-aggregation ablation. Elementwise, so it serves both the scalar (single-edge)
+        and the [B] (batched) paths."""
+        return 100 * torch.sqrt(S + eps)
+
     def forward(self, edge_id: str) -> torch.Tensor:
+        """Predicted traffic volume for one target edge.
+
+        An edge with no entry in the OD index cache has no screened OD pair, so its
+        contributions sum to zero.
         """
-        Returns: predicted traffic volume (scalar tensor) for the given ego edge.
-        Uses OD pairs from od_use.csv. Processes rows in chunks to control memory.
-        """
-        edge_dir = f"data/subgraphs/subgraphs/{edge_id}"
+        if self.od_cache.has(edge_id):
+            return self._forward_cached(edge_id)
+        return self._aggregate(torch.zeros((), device=self.device, requires_grad=True))
 
-        # === Load OD pairs (only the selected ones) ===
-        df = pd.read_feather(f"{edge_dir}/od_use.feather", columns=["O","D","t_OD"])
-        # print(f"Number of od pairs for {edge_id}: {df.shape[0]}")
+    def _forward_cached(self, edge_id: str) -> torch.Tensor:
+        """Fast path: OD pairs read from the preloaded index cache (no disk I/O).
+        The cache stores a DENSE NODE INDEX per pair in ascending node-id order, so
+        torch.unique(dense) reproduces the feather path's np.unique(node-id) exactly
+        dense_to_row maps each dense index to its LSOA row for the gather from F."""
+        o_dense, d_dense, t_np = self.od_cache.get(edge_id)
+        O_all = torch.as_tensor(np.asarray(o_dense).astype(np.int64), device=self.device)
+        D_all = torch.as_tensor(np.asarray(d_dense).astype(np.int64), device=self.device)
+        tOD_all = torch.as_tensor(np.asarray(t_np), dtype=torch.float32, device=self.device)
 
-        O_all = df["O"].tolist()
-        D_all = df["D"].tolist()
-        tOD_all = torch.tensor(df["t_OD"].values, dtype=torch.float32, device=self.device)  # [N]
-
-        # === Chunked processing ===
         chunk_size = MODEL["chunk_size"]
-        N = len(df)
+        N = O_all.shape[0]
         sum_contrib = torch.zeros((), device=self.device, requires_grad=True)
 
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
+            uniq_O, inv_O = torch.unique(O_all[start:end], return_inverse=True)
+            uniq_D, inv_D = torch.unique(D_all[start:end], return_inverse=True)
+            t_ODs = tOD_all[start:end]
 
-            # slice this chunk
-            O_nodes = O_all[start:end]
-            D_nodes = D_all[start:end]
-            t_ODs   = tOD_all[start:end]                             # [B]
+            O_emb = self.enc_O(self.F[self.dense_to_row[uniq_O]])[inv_O]
+            D_emb = self.enc_D(self.F[self.dense_to_row[uniq_D]])[inv_D]
 
-            # unique + inverse indices
-            uniq_O, inv_O = np.unique(O_nodes, return_inverse=True)
-            uniq_D, inv_D = np.unique(D_nodes, return_inverse=True)
+            z_pair = self.pair_head(torch.cat([O_emb, D_emb], dim=1)).squeeze(-1)
+            s_pair = self.pair_activation(z_pair)
+            p_dist = self.dist_head(t_ODs)
 
-            # ---- Node features -> embeddings (chunk) ----
-            O_feats = self._stack_features(uniq_O)               # [B, lsoa_dim]
-            D_feats = self._stack_features(uniq_D)               # [B, lsoa_dim]
-            O_emb_u   = self.enc_O(O_feats)                            # [B, d]
-            D_emb_u   = self.enc_D(D_feats)                            # [B, d]
-            # gather back to original order
-            O_emb = O_emb_u[torch.from_numpy(inv_O).to(self.device)]
-            D_emb = D_emb_u[torch.from_numpy(inv_D).to(self.device)]
+            sum_contrib = sum_contrib + torch.sum(s_pair * p_dist)
 
-            # ---- Pair scorer (chunk) ----
-            pair_in = torch.cat([O_emb, D_emb], dim=1)               # [B, 2d]
-            z_pair  = self.pair_head(pair_in).squeeze(-1)            # [B]
-            s_pair  = self.pair_activation(z_pair)                   # [B] ≥ 0
+        return self._aggregate(sum_contrib)
 
-            # ---- Distance-based probability (chunk) ----
-            p_dist  = self.dist_head(t_ODs)                          # [B] in (0,1)
+    def forward_batch(self, edge_ids):
+        """Predict a batch of edges in one segment-summed forward.
 
-            # ---- Accumulate (keeps gradient graph across chunks) ----
-            sum_contrib = sum_contrib + torch.sum(s_pair * p_dist) # scalar
+        Concatenate all edges' OD pairs, push them through the encoders/MLPs together
+        (one big GPU op instead of one-per-edge), then a segment-sum (index_add by each
+        pair's edge id) recovers per-edge flow sums. Keeps the GPU saturated and
+        amortises per-edge Python/launch overhead. Requires the OD cache.
 
-        pred = 100 * torch.sqrt(sum_contrib)
+        Batching changes the dropout grouping and the
+        optimizer sees a B-edge mini-batch.
+        Returns predictions as a [len(edge_ids)] tensor, in edge_ids order.
+        """
+        # gather each edge's dense O/D indices + travel times, tagged by batch position.
+        # an edge with no OD pairs has no cache entry -> empty arrays -> its seg_sum stays
+        # 0 -> pred ~ 0 (matches the single-edge path's feather fallback for empty edges).
+        O_parts, D_parts, t_parts, seg_parts = [], [], [], []
+        for i, eid in enumerate(edge_ids):
+            if self.od_cache.has(eid):
+                o, d, t = self.od_cache.get(eid)
+            else:
+                o = d = np.empty(0, np.uint16); t = np.empty(0, np.float32)
+            O_parts.append(np.asarray(o)); D_parts.append(np.asarray(d))
+            t_parts.append(np.asarray(t)); seg_parts.append(np.full(len(o), i, dtype=np.int64))
+        O_all = torch.as_tensor(np.concatenate(O_parts).astype(np.int64), device=self.device)
+        D_all = torch.as_tensor(np.concatenate(D_parts).astype(np.int64), device=self.device)
+        t_all = torch.as_tensor(np.concatenate(t_parts), dtype=torch.float32, device=self.device)
+        seg = torch.as_tensor(np.concatenate(seg_parts), device=self.device)   # pair -> edge index
 
-        return pred
+        B = len(edge_ids)
+        P = O_all.shape[0]
+        chunk_size = MODEL["chunk_size"]
+        seg_sum = torch.zeros(B, device=self.device, requires_grad=True)         # per-edge flow sum
+
+        for start in range(0, P, chunk_size):
+            end = min(start + chunk_size, P)
+            uniq_O, inv_O = torch.unique(O_all[start:end], return_inverse=True)
+            uniq_D, inv_D = torch.unique(D_all[start:end], return_inverse=True)
+
+            O_emb = self.enc_O(self.F[self.dense_to_row[uniq_O]])[inv_O]
+            D_emb = self.enc_D(self.F[self.dense_to_row[uniq_D]])[inv_D]
+            s_pair = self.pair_activation(self.pair_head(torch.cat([O_emb, D_emb], dim=1)).squeeze(-1))
+            p_dist = self.dist_head(t_all[start:end])
+
+            # scatter each pair's contribution into its edge's running total
+            seg_sum = seg_sum.index_add(0, seg[start:end], s_pair * p_dist)
+
+        # + eps under sqrt: an edge with no pairs in the batch sums to 0 (sqrt'(0)=inf)
+        return self._aggregate(seg_sum, eps=1e-12)

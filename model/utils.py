@@ -135,6 +135,43 @@ def R_square(label_z, pred_z, scaler):
     # print(f"GT: {label}, Pred: {pred}, R^2: {r2}")
     return r2
 
+# --- percentage-based and interpretable error measures ---
+# NB: the MAPE() above is actually symmetric (denominator (label+pred)/2).
+# Additional percentage-based and interpretable error measures.
+
+def SMAPE(label_z, pred_z, scaler):
+    # Symmetric MAPE in [0, 200]; bounded, robust to small denominators.
+    pred = scaler.inverse_transform(pred_z) if scaler else pred_z
+    pred = torch.clamp(pred, min=0.0)
+    label = scaler.inverse_transform(label_z) if scaler else label_z
+    return torch.mean(torch.abs(label - pred) / ((torch.abs(label) + torch.abs(pred)) / 2 + 1e-8)) * 100
+
+def MAPE_true(label_z, pred_z, scaler):
+    # Classic MAPE (|y-yhat|/|y|). Explodes on low-AADT links; report with care.
+    pred = scaler.inverse_transform(pred_z) if scaler else pred_z
+    pred = torch.clamp(pred, min=0.0)
+    label = scaler.inverse_transform(label_z) if scaler else label_z
+    return torch.mean(torch.abs(label - pred) / (torch.abs(label) + 1e-8)) * 100
+
+def wMAPE(label_z, pred_z, scaler):
+    # Volume-weighted MAPE = sum|y-yhat| / sum|y|; robust headline percentage error.
+    pred = scaler.inverse_transform(pred_z) if scaler else pred_z
+    pred = torch.clamp(pred, min=0.0)
+    label = scaler.inverse_transform(label_z) if scaler else label_z
+    return torch.sum(torch.abs(label - pred)) / (torch.sum(torch.abs(label)) + 1e-8) * 100
+
+def MGEH_hourly(label_z, pred_z, scaler, hours=24.0):
+    # GEH on hourly-equivalent flow (AADT/hours). The DMRB GEH<5 acceptance band
+    # is defined for hourly volumes; this rescales daily AADT into that frame.
+    # Equivalent to MGEH / sqrt(hours).
+    pred = scaler.inverse_transform(pred_z) if scaler else pred_z
+    pred = torch.clamp(pred, min=0.0)
+    label = scaler.inverse_transform(label_z) if scaler else label_z
+    pred_h = pred / hours
+    label_h = label / hours
+    gehs = torch.sqrt(2 * (pred_h - label_h) ** 2 / (pred_h + label_h + 1e-8))
+    return torch.mean(gehs)
+
 def kfold_split(edge_ids: Sequence[str], k: int = 5, seed: int = 2) -> List[List[str]]:
     """
     Deterministic K-fold partition of edge_ids.
@@ -244,3 +281,24 @@ def get_spatial_cv_split(
 
     print(f"[Spatial CV] #val_edges = {len(val_ids)}, #train_edges = {len(train_ids)}")
     return train_ids, val_ids
+
+
+def make_split(all_edge_ids, cv_type="random", cv_fold=4, three_way=False,
+               val_frac=0.125, seed=1, cv_k=5):
+    """Shared CV split used by train.py AND all baseline/ablation scripts, so every model
+    trains/validates/tests on identical edge sets per fold [5.1.31]. Returns
+    (train_ids, val_ids, test_ids). test = held-out fold (random) or region (spatial);
+    three_way carves a val subset (early-stop only) from the training pool; 2-way sets
+    val == test (the submitted protocol)."""
+    import random as _random
+    if cv_type == "spatial":
+        pool, test_ids = get_spatial_cv_split(all_edge_ids, fold_idx=cv_fold)
+    else:
+        pool, test_ids = get_cv_split(all_edge_ids, k=cv_k, fold_idx=cv_fold, seed=seed)
+    if three_way:
+        pool = list(pool); _random.Random(seed).shuffle(pool)
+        nval = max(1, int(len(pool) * val_frac))
+        val_ids, train_ids = pool[:nval], pool[nval:]
+    else:
+        train_ids, val_ids = list(pool), list(test_ids)
+    return train_ids, val_ids, list(test_ids)

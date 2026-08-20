@@ -131,8 +131,9 @@ def load_gt():
       - scaler: fitted Scaler on raw volumes
     Also prints descriptive statistics of raw GT before normalization.
     """
-    # ---- Load GT JSON ----
-    with open("data/traffic_volume/" + DATA["gt"], "r") as f:
+    # ---- Load GT JSON (GT_FILE env overrides config DATA['gt'] for the 4.1 target sensitivity) ----
+    gt_file = os.environ.get("GT_FILE", DATA["gt"])
+    with open("data/traffic_volume/" + gt_file, "r") as f:
         gt_data = json.load(f)
 
     # ---- Filter by OD availability ----

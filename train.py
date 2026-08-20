@@ -5,10 +5,24 @@ import logging
 import datetime
 import random
 
-from config import DATA, TRAINING
+from config import DATA, TRAINING, MODEL_NAME
 from model.deepdemand import DeepDemand
 from model.dataloader import load_gt, load_json, get_lsoa_vector
 import model.utils as utils
+
+
+ModelCls = DeepDemand
+# MODEL_VARIANT swaps in a DeepDemand subclass so an ablation reuses the whole training
+# pipeline. 'full' (or unset) is the reported model.
+_variant = os.environ.get("MODEL_VARIANT")
+if _variant and _variant != "full":
+    from model.ablation_models import (
+        AblationSharedEncoder, AblationConstantDeterrence, AblationLinearAggregation)
+    _vmap = {"shared_encoder": AblationSharedEncoder,
+             "constant_deterrence": AblationConstantDeterrence,
+             "linear_aggregation": AblationLinearAggregation}
+    ModelCls = _vmap[_variant]
+    print(f"[variant] MODEL_VARIANT={_variant} -> {ModelCls.__name__}")
 
 
 class DeepDemandTrainer:
@@ -30,59 +44,87 @@ class DeepDemandTrainer:
 
         self.device = torch.device(TRAINING['device'])
 
-        # Logging
-        os.makedirs('eval/logs', exist_ok=True)
+        # Logging (nested by MODEL_NAME so different models don't overwrite each other).
+        # RUN_NAME env overrides the log/checkpoint name so each CV fold is separate.
+        run_name = os.environ.get("RUN_NAME", TRAINING["name"])
+        log_dir = f'eval/logs/{MODEL_NAME}'
+        os.makedirs(log_dir, exist_ok=True)
         logging.basicConfig(
-            filename=f'eval/logs/{TRAINING["name"]}.log',
+            filename=f"{log_dir}/{run_name}{'_posthoc' if os.environ.get('POSTHOC_CKPT') else ''}.log",
             level=logging.INFO,
             format='%(asctime)s:%(levelname)s:%(message)s',
             filemode='w'
         )
-        # -------- run folder (unique per training run) --------
-        self.run_dir = f"param/{TRAINING['name']}"
+        # -------- run folder (unique per training run, nested by MODEL_NAME) --------
+        self.run_dir = f"param/{MODEL_NAME}/{run_name}"
         os.makedirs(self.run_dir, exist_ok=True)
         logging.info(f"Run directory: {self.run_dir}")
         print(f"[Run dir] {self.run_dir}")
 
-        # ------ preload features once (optionally PCA) -------
-        lsoa_json = load_json(DATA["lsoa_json"])
+        # ------ preload features once (optionally PCA), or attach the OD-index cache ------
         node_to_lsoa = load_json("data/node_features/node_to_lsoa.json")
+        use_cache = TRAINING.get("use_od_cache", False) or os.environ.get("USE_OD_CACHE") == "1"
 
-        # build a deterministic ordering of LSOAs
-        lsoa_codes = sorted(lsoa_json.keys())
-        # stack raw feature matrix
-        feat_rows = []
-        for code in lsoa_codes:
-            v = get_lsoa_vector(lsoa_json[code])  # torch tensor 1D
-            feat_rows.append(v.cpu().numpy())
-        X = np.vstack(feat_rows).astype(np.float32)  # (N_lsoa, F_raw)
-
-        feature_bank = {}    # {lsoa_code: torch.tensor(feature_dim,)}
-
-        if TRAINING.get("pca", False):
-            k = int(TRAINING.get("pca_components", 32))
-            Xp, mean, comps = utils.pca_project(X, k)
-            # store projected vectors
-            for i, code in enumerate(lsoa_codes):
-                feature_bank[code] = torch.from_numpy(Xp[i])  # CPU tensor; model moves to device
-            # (optional) persist PCA model for reuse/repro
-            os.makedirs("data/node_features", exist_ok=True)
-            np.savez("data/node_features/pca_model_lsoa21.npz",
-                     mean=mean, components=comps, codes=np.array(lsoa_codes, dtype=object))
-            logging.info(f"PCA enabled: raw_dim={X.shape[1]}, k={k}")
-            print(f"[PCA] raw_dim={X.shape[1]} -> k={k}; saved pca_model_lsoa21.npz")
+        if use_cache:
+            # P0 fast path: prebuilt OD-index cache (no per-step feather reads) +
+            # prebuilt post-PCA feature matrix F. feature_bank is derived from F so the
+            # feather fallback (if any edge is missing) stays consistent.
+            from model.od_cache import OdIndexCache
+            cache = OdIndexCache()  # per-edge .npz files
+            feat_npz = os.environ.get("FEATURE_NPZ")  # 4.2 vintage-feature sensitivity: swap F (64-dim, same LSOA order, same OD cache)
+            if feat_npz:
+                _d = np.load(feat_npz, allow_pickle=True)
+                Fnp = _d["F"].astype(np.float32)
+                assert [str(c) for c in _d["codes"]] == list(cache.lsoa_codes), "FEATURE_NPZ codes != cache lsoa_codes"
+                print(f"[FEATURE_NPZ] vintage F from {feat_npz}: {Fnp.shape}")
+            else:
+                Fnp = cache.feature_matrix().astype(np.float32)
+            F_t = torch.from_numpy(Fnp)
+            feature_bank = {c: F_t[i] for i, c in enumerate(cache.lsoa_codes)}
+            print(f"[Model] {MODEL_NAME} -> {ModelCls.__name__} | OD cache ON "
+                  f"(per-edge, dense_nodes={len(cache.dense_to_row)}, F={tuple(F_t.shape)})")
+            logging.info(f"OD cache enabled; F={tuple(F_t.shape)}")
+            self.model = ModelCls(feature_bank=feature_bank, node_to_lsoa=node_to_lsoa,
+                                  od_cache=cache, feature_matrix=F_t).to(self.device)
         else:
-            # keep original feature vectors
-            for i, code in enumerate(lsoa_codes):
-                feature_bank[code] = torch.from_numpy(X[i])
+            lsoa_json = load_json(DATA["lsoa_json"])
+            lsoa_codes = sorted(lsoa_json.keys())
+            feat_rows = [get_lsoa_vector(lsoa_json[code]).cpu().numpy() for code in lsoa_codes]
+            X = np.vstack(feat_rows).astype(np.float32)
 
-        # Initialize model and optimizer
-        self.model = DeepDemand(feature_bank=feature_bank, node_to_lsoa=node_to_lsoa).to(self.device)
+            feature_bank = {}
+            if TRAINING.get("pca", False):
+                k = int(TRAINING.get("pca_components", 32))
+                Xp, mean, comps = utils.pca_project(X, k)
+                for i, code in enumerate(lsoa_codes):
+                    feature_bank[code] = torch.from_numpy(Xp[i])
+                os.makedirs("data/node_features", exist_ok=True)
+                np.savez("data/node_features/pca_model_lsoa21.npz",
+                         mean=mean, components=comps, codes=np.array(lsoa_codes, dtype=object))
+                logging.info(f"PCA enabled: raw_dim={X.shape[1]}, k={k}")
+                print(f"[PCA] raw_dim={X.shape[1]} -> k={k}; saved pca_model_lsoa21.npz")
+            else:
+                for i, code in enumerate(lsoa_codes):
+                    feature_bank[code] = torch.from_numpy(X[i])
+
+            print(f"[Model] Using: {MODEL_NAME} -> {ModelCls.__name__}")
+            logging.info(f"Model class: {MODEL_NAME} -> {ModelCls.__name__}")
+            self.model = ModelCls(feature_bank=feature_bank, node_to_lsoa=node_to_lsoa).to(self.device)
 
         # LR schedule (staged)
-        self.lr_stages = TRAINING['lr']
+        _lr_env = os.environ.get("LR")
+        self.lr_stages = [float(x) for x in _lr_env.split(",")] if _lr_env else TRAINING['lr']
         self.current_stage_idx = 0
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr_stages[self.current_stage_idx], weight_decay = 1e-4)
+        # Gradient accumulation over N edges per optimizer step (env GRAD_ACCUM overrides config).
+        self.grad_accum = int(os.environ.get("GRAD_ACCUM", TRAINING.get("grad_accum", 1)))
+        if self.grad_accum > 1:
+            print(f"[train] gradient accumulation: {self.grad_accum} steps / optimizer update")
+            logging.info(f"grad_accum={self.grad_accum}")
+        self.batch_edges = int(os.environ.get("BATCH_EDGES", TRAINING.get("batch_edges", 1)))
+        if self.batch_edges > 1:
+            print(f"[train] batched forward: {self.batch_edges} edges / step")
+            logging.info(f"batch_edges={self.batch_edges}")
 
         # Load checkpoint if provided
         ckpt_path = TRAINING.get("checkpoint")
@@ -95,17 +137,22 @@ class DeepDemandTrainer:
         # Load GT and split
         self.edge_to_gt, self.scaler = load_gt()
         self.all_edge_ids = list(self.edge_to_gt.keys())
-        self.train_ids, self.val_ids = utils.get_cv_split(
-            self.all_edge_ids,
-            k=TRAINING["cv_k"],
-            fold_idx=TRAINING["cv_fold"],
-            seed=TRAINING["seed"],
-        )
-        logging.info(f"CV split: k={TRAINING['cv_k']}, fold={TRAINING['cv_fold']} "
-                    f"(train={len(self.train_ids)}, val={len(self.val_ids)})")
+        # CV_TYPE ('random'|'spatial') + CV_FOLD select protocol/fold. The held-out fold is
+        # the TEST set. THREE_WAY=1 carves a VAL subset out of the training pool for
+        # early-stopping ONLY (test stays untouched -> unbiased); else 2-way (val == test,
+        # the submitted protocol).
+        cv_type = os.environ.get("CV_TYPE", TRAINING.get("cv_type", "random"))
+        cv_fold = int(os.environ.get("CV_FOLD", TRAINING["cv_fold"]))
+        three_way = os.environ.get("THREE_WAY", "0") == "1"
+        val_frac = float(os.environ.get("VAL_FRAC", "0.125"))
+        self.train_ids, self.val_ids, self.test_ids = utils.make_split(
+            self.all_edge_ids, cv_type=cv_type, cv_fold=cv_fold, three_way=three_way,
+            val_frac=val_frac, seed=TRAINING["seed"], cv_k=TRAINING["cv_k"])
+        logging.info(f"{cv_type} CV fold={cv_fold} three_way={three_way}: "
+                     f"train={len(self.train_ids)} val={len(self.val_ids)} test={len(self.test_ids)}")
         
         # Early stopping config (on Validation MGEH)
-        self.patience_steps = TRAINING["patience"]                       # evaluations without sufficient improvement
+        self.patience_steps = int(os.environ.get("PATIENCE", TRAINING["patience"]))  # evals without sufficient improvement (env PATIENCE overrides)
         self.min_improve = 0.1                         # absolute MGEH improvement required
         self.eval_interval = TRAINING['eval_interval'] # evaluations cadence (in training steps)
 
@@ -145,144 +192,137 @@ class DeepDemandTrainer:
 
     # ------------------------- core -------------------------
 
+    def _predict_batch(self, batch):
+        """Predictions for a list of edges, as a [len(batch)] tensor. Uses the batched
+        segment-sum forward when batch_edges>1 and the OD cache is attached;
+        otherwise per-edge forward() (preserves the single-edge path exactly)."""
+        if self.batch_edges > 1 and getattr(self.model, "od_cache", None) is not None:
+            return self.model.forward_batch(batch)
+        return torch.cat([self.model(e).reshape(1) for e in batch]).to(self.device)
+
+    def _eval_and_maybe_stop(self, epoch, step) -> bool:
+        """Validation eval + early-stopping + staged-LR control. Returns True to stop."""
+        metrics = self.evaluate_random_sample(epoch, step)
+        if metrics is None:
+            return False
+        val_geh = metrics['val_geh']
+        self.total_eval_calls_in_stage += 1
+
+        # improvement = MGEH dropped by at least self.min_improve
+        if (self.best_val_geh - val_geh) >= self.min_improve:
+            self.best_val_geh = val_geh
+            self.best_state_dict = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+            self.steps_since_improve = 0
+            logging.info(f"[IMPROVED] Stage {self.current_stage_idx+1} best_val_MGEH={self.best_val_geh:.6f}")
+        else:
+            self.steps_since_improve += 1
+            logging.info(f"[NO-IMPROVE] {self.steps_since_improve}/{self.patience_steps} "
+                         f"(Delta={self.best_val_geh - val_geh:.6f}, min_improve={self.min_improve})")
+
+        if self.steps_since_improve >= self.patience_steps:
+            if self.best_state_dict is not None:
+                self.model.load_state_dict(self.best_state_dict)
+                print(f"[STAGE {self.current_stage_idx+1}] Restored best weights before dropping LR.")
+                logging.info(f"Restored best weights for stage {self.current_stage_idx+1} before LR drop.")
+            self._save_best_for_stage()
+            if self.current_stage_idx + 1 >= len(self.lr_stages):
+                print("[EARLY STOP] Final stage reached and patience exhausted. Training stops.")
+                logging.info("Final LR stage patience exhausted. Stopping training.")
+                return True
+            self.current_stage_idx += 1
+            self._set_lr(self.lr_stages[self.current_stage_idx])
+            self._reset_stage_trackers()
+            logging.info(f"Entering LR stage {self.current_stage_idx+1}/{len(self.lr_stages)}.")
+        return False
+
     def train_model(self):
         counter = 0
-        # ensure starting LR
         self._set_lr(self.lr_stages[self.current_stage_idx])
+        B = self.batch_edges   # edges per step; B=1 is single-edge SGD
 
         for epoch in range(TRAINING['epoch']):
             logging.info(f"Epoch {epoch} started.")
             random.shuffle(self.train_ids)
+            last_eval, batch_idx = 0, 0
 
-            for step, edge_id in enumerate(self.train_ids):
-                counter += 1
+            for start in range(0, len(self.train_ids), B):
+                batch = self.train_ids[start:start + B]
+                counter += len(batch)
+                batch_idx += 1
                 self.model.train()
-                gt = self.edge_to_gt[edge_id]
-                pred = self.model(edge_id)
 
-                gt_tensor = torch.tensor([gt], dtype=torch.float32, device=self.device)
-                pred = pred.to(self.device)
-
-                loss = self.compute_loss(gt_tensor, pred, TRAINING['loss_function'])
-                self.optimizer.zero_grad()
+                preds = self._predict_batch(batch)
+                gts = torch.tensor([self.edge_to_gt[e] for e in batch],
+                                   dtype=torch.float32, device=self.device)
+                loss = self.compute_loss(gts, preds, TRAINING['loss_function']) / self.grad_accum
                 loss.backward()
-                if TRAINING['clip_gradient']:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), TRAINING['clip_gradient'])
-                self.optimizer.step()
+                if batch_idx % self.grad_accum == 0:
+                    if TRAINING['clip_gradient']:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), TRAINING['clip_gradient'])
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
 
-                # Evaluation interval
-                if counter % self.eval_interval == 0:
-                    metrics = self.evaluate_random_sample(epoch, step)
-                    if metrics is None:
-                        continue
-                    val_geh = metrics['val_geh']
-                    self.total_eval_calls_in_stage += 1
+                # evaluate roughly every eval_interval EDGES (counter steps by len(batch))
+                if counter - last_eval >= self.eval_interval:
+                    last_eval = counter
+                    if self._eval_and_maybe_stop(epoch, start):
+                        return
 
-                    # Early stopping criterion on MGEH (lower is better):
-                    # consider it an improvement only if MGEH decreased by at least self.min_improve
-                    if (self.best_val_geh - val_geh) >= self.min_improve:
-                        self.best_val_geh = val_geh
-                        # store CPU state_dict for a clean, weights-only save
-                        self.best_state_dict = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
-                        self.steps_since_improve = 0
-                        logging.info(f"[IMPROVED] Stage {self.current_stage_idx+1} best_val_MGEH={self.best_val_geh:.6f}")
-                    else:
-                        self.steps_since_improve += 1
-                        logging.info(
-                            f"[NO-IMPROVE] {self.steps_since_improve}/{self.patience_steps} "
-                            f"(Delta={self.best_val_geh - val_geh:.6f}, min_improve={self.min_improve})"
-                        )
-
-                    # Early stopping for this LR stage
-                    if self.steps_since_improve >= self.patience_steps:
-                        if self.best_state_dict is not None:
-                            self.model.load_state_dict(self.best_state_dict)
-                            print(f"[STAGE {self.current_stage_idx+1}] Restored best weights before dropping LR.")
-                            logging.info(f"Restored best weights for stage {self.current_stage_idx+1} before LR drop.")
-
-                        # Save best for this stage before dropping LR
-                        self._save_best_for_stage()
-
-                        # Move to next LR stage; if done with last stage, exit
-                        if self.current_stage_idx + 1 >= len(self.lr_stages):
-                            print("[EARLY STOP] Final stage reached and patience exhausted. Training stops.")
-                            logging.info("Final LR stage patience exhausted. Stopping training.")
-                            return
-                        else:
-                            # advance stage
-                            self.current_stage_idx += 1
-                            self._set_lr(self.lr_stages[self.current_stage_idx])
-                            # reset trackers for new stage
-                            self._reset_stage_trackers()
-                            logging.info(f"Entering LR stage {self.current_stage_idx+1}/{len(self.lr_stages)}.")
-
-        # Finished all epochs; also save best of final stage if any
         self._save_best_for_stage()
         logging.info("Training finished (max epochs reached).")
 
-    def evaluate_random_sample(self, epoch, step):
+    def _predict(self, ids):
+        """Forward all edges in `ids` (eval mode, no grad). Returns (kept_edge_ids, gt_z, pred_z)
+        tensors in scaler space, or None if empty."""
         self.model.eval()
         with torch.no_grad():
-            sample_train = random.sample(self.train_ids, min(TRAINING['eval_sample_train'], len(self.train_ids)))
-            sample_val = random.sample(self.val_ids, min(TRAINING['eval_sample_eval'], len(self.val_ids)))
-
-            # ----- Training subset (for logging only) -----
-            preds, gts = [], []
-            for edge_id in sample_train:
-                gt = self.edge_to_gt[edge_id]
-                pred = self.model(edge_id)
-                if pred is None or pred.numel() == 0:
+            kept, preds, gts = [], [], []
+            for edge_id in ids:
+                p = self.model(edge_id)
+                if p is None or p.numel() == 0:
                     continue
-                preds.append(pred.unsqueeze(0))
-                gts.append(torch.tensor([gt], dtype=torch.float32, device=self.device))
-            if preds and gts:
-                preds_t = torch.cat(preds)
-                gts_t = torch.cat(gts)
-                train_mae = utils.MAE(gts_t, preds_t, self.scaler).item()
-                train_geh = utils.MGEH(gts_t, preds_t, self.scaler).item()
-                train_rmse = utils.RMSE(gts_t, preds_t, self.scaler).item()
-                train_r2 = utils.R_square(gts_t, preds_t, self.scaler).item()
-                logging.info(
-                    f"Epoch {epoch} Step {step} Train Eval: "
-                    f"RMSE: {train_rmse:.6f}, MAE: {train_mae:.6f}, MGEH: {train_geh:.6f}, "
-                    f"R2: {train_r2:.6f}"
-                )
-
-            # ----- Validation subset (used for early stopping) -----
-            preds, gts = [], []
-            for edge_id in sample_val:
-                gt = self.edge_to_gt[edge_id]
-                pred = self.model(edge_id)
-                if pred is None or pred.numel() == 0:
-                    continue
-                preds.append(pred.unsqueeze(0))
-                gts.append(torch.tensor([gt], dtype=torch.float32, device=self.device))
-
-            if not preds or not gts:
-                logging.warning("Empty predictions during evaluation; skipping metrics.")
+                kept.append(edge_id); preds.append(p.reshape(1))
+                gts.append(torch.tensor([self.edge_to_gt[edge_id]], dtype=torch.float32, device=self.device))
+            if not preds:
                 return None
+            return kept, torch.cat(gts), torch.cat(preds)
 
-            preds_t = torch.cat(preds)
-            gts_t = torch.cat(gts)
+    def evaluate_random_sample(self, epoch, step):
+        # Early-stopping signal: full validation set, MGEH only -- the ONLY metric used on the fly.
+        # Every other metric is computed post-hoc from the saved per-edge predictions (save_outputs).
+        r = self._predict(self.val_ids)
+        if r is None:
+            logging.warning("Empty val predictions during evaluation; skipping.")
+            return None
+        _, G, P = r
+        val_geh = utils.MGEH(G, P, self.scaler).item()
+        logging.info(f"Epoch {epoch} Step {step} Validation MGEH: {val_geh:.6f} "
+                     f"(stage {self.current_stage_idx+1}/{len(self.lr_stages)}, "
+                     f"lr={self.lr_stages[self.current_stage_idx]:.0e})")
+        return {'val_geh': val_geh}
 
-            val_rmse = utils.RMSE(gts_t, preds_t, self.scaler).item()
-            val_mae = utils.MAE(gts_t, preds_t, self.scaler).item()
-            val_geh = utils.MGEH(gts_t, preds_t, self.scaler).item()
-            val_r2 = utils.R_square(gts_t, preds_t, self.scaler).item()
-
-            logging.info(
-                f"Epoch {epoch} Step {step} Validation Eval: "
-                f"RMSE: {val_rmse:.6f}, MAE: {val_mae:.6f}, MGEH: {val_geh:.6f}, "
-                f"R2: {val_r2:.6f} "
-                f"(stage {self.current_stage_idx+1}/{len(self.lr_stages)}, lr={self.lr_stages[self.current_stage_idx]:.0e})"
-            )
-
-            return {
-                'val_mse': val_rmse,
-                'val_mae': val_mae,
-                'val_geh': val_geh,
-                'val_r2': val_r2
-            }
+    def save_outputs(self):
+        """Restore best weights, then save per-edge predicted AADT (de-scaled) for train/val/test
+        to {run_dir}/pred.csv. All metrics are computed post-hoc from this file
+        (eval/posthoc_metrics.py) -- training produces nothing else."""
+        import csv
+        if self.best_state_dict is not None:
+            self.model.load_state_dict(self.best_state_dict)
+        out = os.path.join(self.run_dir, "pred.csv")
+        n = 0
+        with open(out, "w", newline="") as f:
+            w = csv.writer(f); w.writerow(["edge_id", "set", "gt", "pred"])
+            for tag, ids in (("train", self.train_ids), ("val", self.val_ids), ("test", self.test_ids)):
+                r = self._predict(ids)
+                if r is None:
+                    continue
+                kept, G, P = r
+                gt = (self.scaler.inverse_transform(G) if self.scaler else G).cpu().numpy()
+                pr = (self.scaler.inverse_transform(P) if self.scaler else P).cpu().numpy()
+                for e, g, p in zip(kept, gt, pr):
+                    w.writerow([e, tag, float(g), float(p)]); n += 1
+        print(f"[saved] {n} per-edge predictions -> {out}")
+        logging.info(f"Saved {n} per-edge predictions -> {out}")
 
     def save_model(self, epoch):
         formatted_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -295,8 +335,17 @@ if __name__ == '__main__':
     print("Initiating model...")
     trainer = DeepDemandTrainer()
 
-    print("Training started...")
-    trainer.train_model()
+    ckpt = os.environ.get("POSTHOC_CKPT")
+    if ckpt:
+        # post-hoc: load a saved checkpoint, regenerate + save per-edge predictions, no training
+        print(f"[posthoc] loading {ckpt}")
+        trainer.model.load_state_dict(torch.load(ckpt, map_location=trainer.device, weights_only=True))
+        trainer.best_state_dict = None
+        trainer.save_outputs()
+    else:
+        print("Training started...")
+        trainer.train_model()
+        trainer.save_outputs()
 
     for handler in logging.root.handlers[:]:
         handler.close()

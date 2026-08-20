@@ -5,10 +5,13 @@ import logging
 import datetime
 import random
 
-from config import DATA, TRAINING
+from config import DATA, TRAINING, MODEL_NAME
 from model.deepdemand import DeepDemand
 from model.dataloader import load_gt, load_json, get_lsoa_vector
 import model.utils as utils
+
+
+ModelCls = DeepDemand
 
 
 class DeepDemandTrainer:
@@ -30,16 +33,17 @@ class DeepDemandTrainer:
 
         self.device = torch.device(TRAINING['device'])
 
-        # Logging
-        os.makedirs('eval/logs', exist_ok=True)
+        # Logging (nested by MODEL_NAME so different models don't overwrite each other)
+        log_dir = f'eval/logs/{MODEL_NAME}'
+        os.makedirs(log_dir, exist_ok=True)
         logging.basicConfig(
-            filename=f'eval/logs/{TRAINING["name"]}.log',
+            filename=f'{log_dir}/{TRAINING["name"]}.log',
             level=logging.INFO,
             format='%(asctime)s:%(levelname)s:%(message)s',
             filemode='w'
         )
-        # -------- run folder (unique per training run) --------
-        self.run_dir = f"param/{TRAINING['name']}"
+        # -------- run folder (unique per training run, nested by MODEL_NAME) --------
+        self.run_dir = f"param/{MODEL_NAME}/{TRAINING['name']}"
         os.makedirs(self.run_dir, exist_ok=True)
         logging.info(f"Run directory: {self.run_dir}")
         print(f"[Run dir] {self.run_dir}")
@@ -76,8 +80,10 @@ class DeepDemandTrainer:
             for i, code in enumerate(lsoa_codes):
                 feature_bank[code] = torch.from_numpy(X[i])
 
-        # Initialize model and optimizer
-        self.model = DeepDemand(feature_bank=feature_bank, node_to_lsoa=node_to_lsoa).to(self.device)
+        # Initialize model and optimizer (dynamic class from config.MODEL_NAME)
+        print(f"[Model] Using: {MODEL_NAME} -> {ModelCls.__name__}")
+        logging.info(f"Model class: {MODEL_NAME} -> {ModelCls.__name__}")
+        self.model = ModelCls(feature_bank=feature_bank, node_to_lsoa=node_to_lsoa).to(self.device)
 
         # LR schedule (staged)
         self.lr_stages = TRAINING['lr']
