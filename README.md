@@ -9,7 +9,7 @@ This repository provides the official PyTorch implementation accompanying the pa
 
 > **Yue Li**, Shujuan Chen, Akihiro Shimoda, Ying Jin  
 > *Interpretable long-term traffic modelling on national road networks using theory-informed deep learning*  
-> (Journal information to be updated)
+> *Transportation Research Part C: Emerging Technologies*, 194, 106102 (2027). https://doi.org/10.1016/j.trc.2026.106102
 
 DeepDemand integrates behavioural travel-demand theory with neural network modelling of origin–destination (OD) interactions. It enables spatially transferable, policy-relevant traffic forecasting with explicit interpretability at both the OD and network levels.
 
@@ -220,11 +220,14 @@ For methodological transparency, full reproduction from raw data is encouraged.
 If you use DeepDemand in your research, please cite:
 
 ```bibtex
-@article{DeepDemand2026,
-  author  = {Yue Li and Shujuan Chen and Akihiro Shimoda and Ying Jin},
+@article{LiEtAl2027,
+  author  = {Li, Yue and Chen, Shujuan and Shimoda, Akihiro and Jin, Ying},
   title   = {Interpretable long-term traffic modelling on national road networks using theory-informed deep learning},
-  journal = {To be updated},
-  year    = {2026}
+  journal = {Transportation Research Part C: Emerging Technologies},
+  year    = {2027},
+  volume  = {194},
+  pages   = {106102},
+  doi     = {10.1016/j.trc.2026.106102}
 }
 ```
 
